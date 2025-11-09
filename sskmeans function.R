@@ -2,7 +2,9 @@
 library(tidyverse)
 library(arrangements)
 
-sskmeans <- function(data, k, pos.eq = NULL, neg.eq = NULL, max.iter = 50) {
+## `neq.eg` is OBSERVATION-LEVEL 
+
+sskmeans <- function(data, k, pos.eq = NULL, neg.eq = NULL, max.iter = 50, nstart = 1) {
   
   ##########  If no `neg.eq` input  ############################################
   
@@ -65,7 +67,7 @@ sskmeans <- function(data, k, pos.eq = NULL, neg.eq = NULL, max.iter = 50) {
       }
     } ## skip `neg.eq` entirely in pos-only mode
     
-  ##########  Initializing vaiables   ##########################################
+  ##########  Initializing variables   ##########################################
   
   data_num <- select(data, where(is.numeric))   ## numeric data removes pos/neg
   
@@ -74,6 +76,18 @@ sskmeans <- function(data, k, pos.eq = NULL, neg.eq = NULL, max.iter = 50) {
   
   B <- max(as.integer(data$pos.eq)) ## total number of blocks
   zb <- integer(B)                  ## cluster assignments per block
+  
+  ##########  Sum of Squares tidbits   #########################################
+  
+  totss <- 0  ## total sum of squares
+  for (i in 1:nrow(data_num)) {
+    totss <- totss + sum((data_num[i, ] - colMeans(data_num))^2)
+  }
+  
+  min_totwss <- Inf       ## keeps minimal `tot.withinss`
+  best_result <- NULL   ## result for best `nstart` run
+  
+  for (nstart_placeholder in 1:nstart) { ## ensures `nstart` number restarts
   
   dist.sq <- matrix(nrow = n, ncol = k)   ## Euclidean distances squared per obs
   
@@ -213,21 +227,22 @@ sskmeans <- function(data, k, pos.eq = NULL, neg.eq = NULL, max.iter = 50) {
         left_join(., unnest(pos_lookup, ID), 
                   by = c("neg.eq" = "ID"), 
                   relationship = "many-to-many") %>%
-        select(pos.eq = pos.eq.x, neg.from = pos.eq.y) %>%
+        distinct(pos.eq = pos.eq.x, neg.from = pos.eq.y) %>%
         aggregate(neg.from ~ pos.eq, data = ., c, na.action = na.pass) %>%
         mutate(neg.from = lapply(neg.from, function(x) x[!is.na(x)]))
       # NOTE: a block w/ no neg constraints is not NA, but length = 0
     
       ##########  Check for contradictions  ####################################
       
-      conflict <- any(purrr::map2_lgl(.x = .$pos.eq,
-                                      .y = .$neg.from,
-                                      ~ any(.y == .x)))
+      conflict <- any(purrr::map2_lgl(
+        .x = as.integer(block_rels$pos.eq),
+        .y = block_rels$neg.from,
+        ~ any(as.integer(.y) == .x)
+      ))
       
       if (conflict == TRUE) { ## i.e. only stops if conflict is TRUE
         
-        stop("There is at least one contradiction among `pos.eq` and `neg.eq` 
-             present in the blocks; must resolve inputs before proceeding.")
+        stop("There is at least one contradiction among `pos.eq` and `neg.eq` present in the blocks; must resolve inputs before proceeding.")
       }
       
       ##########  Dealing with z_b for Negative Constraints ####################
@@ -370,19 +385,50 @@ sskmeans <- function(data, k, pos.eq = NULL, neg.eq = NULL, max.iter = 50) {
     summarise(across(where(is.numeric), mean), .groups = "drop") %>%
     as.data.frame()
   
+  ##########  Record best WCSS & result  #####################################
+  
+  WCSS <- numeric(k)  ## initializing WCSS
+  
+  X <- as.matrix(unname(data_num))  ## copy of data_num
+  
+  for (j in 1:p) {  ## over x-vars
+    
+    for (l in 1:k) {  ## over centers
+      
+      for (i in which(cluster == l)) {  ## over clusters
+        
+        WCSS[l] <- WCSS[l] + (X[i, j] - centers_out[l, j + 1])^2  ## WCSS
+        
+      }
+    }
+  }
+  
+  tot.withinss <- sum(WCSS)
+  
   result <- list(
-    "size" = sizes,
     "cluster" = cluster,
     "centers" = centers_out,
+    "totss" = totss,
+    "withinss" = WCSS, ####### this should be per cluster (i.e. k numbers)
+    "tot.withinss" = tot.withinss, ###### sum(withinss)
+    "betweenss"  = totss - tot.withinss, ##### totss-tot.withinss
+    "size" = sizes,
     "iterations" = iter,
     "blocks" = pos_lookup
-  )
+    )
   
   if (!pos_only_mode) {
     result$relationships = block_rels
-    }
+  }
   
-  return(result)
+  if (tot.withinss < min_totwss) { ## keeps best result across `nstart`
+    min_totwss <- tot.withinss
+    best_result <- result
+  }
+  
+  } ## end `for (nstart_placeholder in 1:nstart)`
+  
+  return(best_result)
 }
 
 
@@ -404,7 +450,7 @@ df %>%
   theme_classic()
 
 ## with both pos and neg constraints
-sskmeans(data = df, k = 3, pos.eq = 'pos', neg.eq = 'neg')
+sskmeans(data = df, k = 3, pos.eq = 'pos', neg.eq = 'neg', nstart = 50)
 
 ## with ONLY pos constraints
 sskmeans(data = df[,1:3], k = 3, pos.eq = 'pos')
@@ -424,11 +470,3 @@ df2 <- df %>%
 
 sskmeans(data = df2, k = 3, pos.eq = 'pos', neg.eq = 'neg') ## works the same
 ## NOTE that the input block labels change in the algorithm (e.g. `7` becomes `1`)
-
-## consider adding seeds
-## consider modifying input so pos.eq = 3 could mean column 3, for e.g.
-## remove some result features: have them available but not printed
-## add WCSS and other components in regular kmeans
-## consider adding `nstart`
-## what if centers are picked w/in same block? Recompute centers immediately?
-## what if `neg.eq` is in block-level form --> new function?
