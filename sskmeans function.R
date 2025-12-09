@@ -1,436 +1,373 @@
 
+
 library(tidyverse)
 library(arrangements)
 
-## `neq.eg` is OBSERVATION-LEVEL 
+## `neg.eq` is BLOCK-LEVEL adjacency matrix (i.e must start at block 1, 2, ..., B)
+## might want to change function input `k` to `centers` to match standard kmeans
+## consider saving the sigma squared from the best `nstart` run
 
 sskmeans <- function(data, k, pos.eq = NULL, neg.eq = NULL, max.iter = 50, nstart = 1) {
   
   ##########  If no `neg.eq` input  ############################################
   
-  pos_only_mode <- is.null(neg.eq)  ## note that this runs regular K-Means if no
-                                    ## pos.eq is specified
+  pos_only_mode <- is.null(neg.eq)  ## note that this also runs regular K-Means
+  ## if no `pos.eq` is specified, either
+  
+  data_num <- select(data, where(is.numeric))   ## numeric data ONLY
+  
+  n <- nrow(data_num)    ## number of observations
+  p <- ncol(data_num)    ## number of features (x-vars)
   
   ##########  Ensure `pos.eq` runs as intended  ################################
   
   if (is.null(pos.eq)) {
     
-    data$pos.eq <- seq(nrow(data))  ## imputes vals 1, 2, ..., n
+    pos.eq <- as.list(1:n)  ## imputes vals 1, 2, ..., n
     
-  } else if (!pos.eq %in% names(data)) {  ## must exist as a name in the data
-    
-    stop("`pos.eq` must be the name of a column in `data`")
-    
-  } else { ## good to go!
-    
-    names(data)[names(data) == pos.eq] <- "pos.eq"  ## ensures compatability when 
-    ## referencing `pos.eq`
   }
+  
+  # Table for obs in each Block:
+  
+  pos_lookup <- data.frame(       ## this is just for returned results
+    block = seq_along(pos.eq),    ## only includes blocks specified by user
+    IDs  = I(pos.eq)              ## I() removes list indices; turns into vector
+  )
   
   # Impute missing block labels:
   
-  data$pos.eq <- as.numeric(data$pos.eq)  ## convert to numeric for imputation
+  all <- 1:n    ## all possible indices
   
-  pos.NAs <- which(is.na(data$pos.eq))  ## indexing the NA values
+  used <- unlist(pos.eq)    ## indices already used in `pos.eq`
   
-  if (length(pos.NAs) > 0) {  ## imputation step
-    
-    pos.input <- max(data$pos.eq, na.rm = TRUE)
-    
-    data$pos.eq[pos.NAs] <- pos.input + seq_along(pos.NAs)
-    
-  }
+  unused <- setdiff(all, used)    ## indices not used in `pos.eq`
   
-  data$pos.eq <- as.factor(as.integer(factor(data$pos.eq))) ## ensures no jumps; 
-                                                            ## seq from 1 to B
+  pos.eq <- c(pos.eq, as.list(unused))    ## appends unused indices as their own blocks
   
-  ##########  Ensure `neg.eq` runs as intended  ################################
+  # Initializations before looping:
   
-  if (!pos_only_mode) {
-    
-    if (!neg.eq %in% names(data)) {
-      
-      stop("`neg.eq` must be the name of a list column in `data`")
-      
-      } else { ## good to go!
-        
-        names(data)[names(data) == neg.eq] <- "neg.eq"  ## ensures compatability when 
-                                                        ## referencing `neg.eq`
-        }
-    
-    if (!is.list(data$neg.eq)) {
-      
-      data$neg.eq <- lapply(data$neg.eq, function(x) {   ## converts `neg.eq` to list
-        if (is.na(x)) {NULL}
-        else {x}
-      })
-      }
-    } ## skip `neg.eq` entirely in pos-only mode
-    
-  ##########  Initializing variables   ##########################################
+  B_neg <- nrow(neg.eq)    ## original number of blocks specified (must start at 1)
   
-  data_num <- select(data, where(is.numeric))   ## numeric data removes pos/neg
+  B_pos <- length(pos.eq)    ## total number of blocks after imputing unused obs
+  ## Note: B_neg <= B_pos
   
-  n <- nrow(data)       ## number observations
-  p <- ncol(data_num)   ## number features (x-vars)
+  zb <- integer(B_pos)  ## cluster assignments per block
   
-  B <- max(as.integer(data$pos.eq)) ## total number of blocks
-  zb <- integer(B)                  ## cluster assignments per block
-  
-  ##########  Sum of Squares tidbits   #########################################
+  # Total Sum of Squares:
   
   totss <- 0  ## total sum of squares
-  for (i in 1:nrow(data_num)) {
+  
+  for (i in 1:n) {    ## Euc Dist squared from overall mean for each obs
+    
     totss <- totss + sum((data_num[i, ] - colMeans(data_num))^2)
+    
   }
   
-  min_totwss <- Inf       ## keeps minimal `tot.withinss`
-  best_result <- NULL   ## result for best `nstart` run
+  min_totwss <- Inf    ## keeps minimal `tot.withinss`
   
-  for (nstart_placeholder in 1:nstart) { ## ensures `nstart` number restarts
+  best_result <- NULL    ## result for best `nstart` run
   
-  dist.sq <- matrix(nrow = n, ncol = k)   ## Euclidean distances squared per obs
-  
-  # Centroids
-  centers <- data_num[sample(seq(n), k), ]  ## initializing `k` random centers
-  
-  # Vectors for individual cluster assignments
-  cluster <- integer(n)       ## current iteration
-  prev_cluster <- integer(n)  ## previous iteration
-  
-  # iteration counter & stopper
-  iter <- 1
-  stopper <- 0  ## stops when prev_cluster = cluster  -OR-  max.iter = iter
-  
-  ##########  Table for obs in each Block ####################################
-  
-  pos_lookup <- data %>%
-    mutate(ID = row_number()) %>%
-    aggregate(ID ~ pos.eq, c)
-  
-  ##############################################################################
-  ##########  While Loop starts here  ##########################################
-  ##############################################################################
-  
-  while (stopper == 0) {
+  for (nstart_placeholder in 1:nstart) {    ## ensures `nstart` number restarts
     
-    ############################################################################
-    ##########  Positive K-M  ##################################################
-    ############################################################################
+    dist.sq <- matrix(nrow = n, ncol = k)   ## Euclidean distances squared per obs
     
-    ##########  Euclidean Distances for Observations  ##########################
+    # Centroids / Random Centers Initialization:
     
-    for (i in seq(n)) {
+    centers <- data_num[sample(1:n, k), ]  ## initializing `k` random centers
+    
+    # Vectors for individual cluster assignments
+    
+    cluster <- integer(n)       ## current iteration
+    prev_cluster <- integer(n)  ## previous iteration
+    
+    # Iteration counter & stopper:
+    
+    iter <- 1
+    stopper <- 0  ## stops when prev_cluster = cluster  -OR-  max.iter = iter
+    
+    
+    ##############################################################################
+    ##########  While Loop starts here  ##########################################
+    ##############################################################################
+    
+    while (stopper == 0) {
       
-      distance <- data_num[i, ] %>%
-        rbind(centers) %>%
-        dist()  ## Euclidean Distance
+      ############################################################################
+      ##########  Positive K-M  ##################################################
+      ############################################################################
       
-      dist.sq[i, ] <- distance[1:k]^2   ## records the distance of the ith obs from
-      ## the kth center
-    }
-    
-    ########## Block cluster assignments for positive constraints ONLY`#########`
-    
-    for (b in 1:B) {
+      ##########  Euclidean Distances for Observations  ##########################
       
-      data.b <- dist.sq[data$pos.eq == b, , drop = FALSE] ## data grouped by block
-      
-      if (nrow(data.b) == 1) {
+      for (i in 1:n) {
         
-        zb[b] <- which.min(data.b)  ## cannot perform colSums on singular row
+        distance <- data_num[i, ] %>%
+          rbind(centers) %>%
+          dist()    ## Euclidean Distance
         
-      } else {
-        
-        zb[b] <- which.min(colSums(data.b))   ## minimal within-block SS
-        
+        dist.sq[i, ] <- distance[1:k]^2   ## records the distance of the ith obs
+        ## from the kth center
       }
       
-      cluster[data$pos.eq == b] <- zb[b]  ## assign cluster ID to all obs in block
+      ##########  Block cluster assignments for positive constraints ONLY  #####
       
-    }
-    
-    ############################################################################
-    ##########  Unbiased MLEs for mu & sigma   #################################
-    ############################################################################
-    
-    if (!pos_only_mode) {
-      
-      mu_kj <- matrix(NA, nrow = k, ncol = p)   ## matrix of mean estimates
-    
-      ##########  Calculating each mu_kj #######################################
-    
-      for (j in 1:p) {
-      
-        for (l in 1:k) {
+      for (b in 1:B_pos) {
         
-          mu_kj[l, j] <- mean(data_num[cluster == l, j])
+        data.b <- dist.sq[unlist(pos.eq[b]), , drop = FALSE] ## data grouped by block
         
+        if (nrow(data.b) == 1) {
+          
+          zb[b] <- which.min(data.b)  ## cannot perform colSums on singular row
+          
+        } else {
+          
+          zb[b] <- which.min(colSums(data.b))   ## minimal within-block SS
+          
         }
-      }
-    
-      SSE <- 0  ## initializing SSE (within-cluster)
-    
-      X <- as.matrix(unname(data_num))  ## copy of data_num
-    
-      ##########  Calculating sigma squared ####################################
-    
-      for (j in 1:p) {  ## over x-vars
-      
-        for (l in 1:k) {  ## over centers
         
-          for (i in which(cluster == l)) {  ## over clusters
-          
-            SSE <- SSE + (X[i, j] - mu_kj[l, j])^2  ## WCSS
-          
-          }
-        }
-      }
-    
-      sigma.sq <- SSE / (p * (n - k))  # unbiased
-    
-      ##########################################################################
-      ##########  Negative K-M  ################################################
-      ##########################################################################
-    
-      ##########  Euclidean Distances for Blocks  ##############################
-    
-      dist.sq_b <- matrix(nrow = B, ncol = k)   ## initializing dist.sq_b for blocks
-    
-      for(b in 1:B) {
-      
-        data.b <- as.matrix(data_num[data$pos.eq == b, , drop = FALSE]) # block `b` data
-      
-        dist.b_sum <- 0 # initializing dist.b_sum
-      
-        for(i in 1:nrow(data.b)) {
+        cluster[unlist(pos.eq[b])] <- zb[b]  ## assign cluster ID to all obs in block
         
-          dist.b <- data.b[i,] %>%  ## similar to Euc Dist for single obs
-            rbind(mu_kj) %>%
-            dist()
-        
-          dist.b_sum <- dist.b_sum + dist.b[1:k]^2
-        
-        }
-      
-        dist.sq_b[b,] <- dist.b_sum   ## grouped by obs in block `b`
-      
-      }
-    
-      ##########  Table for Block relationships ################################
-    
-      block_rels <- data %>%
-        mutate(ID = row_number()) %>%             ## either neg is a list column -OR- IDs must be
-        relocate(ID, .before = names(data)) %>%   ## repeated for each additional neg constraint
-        unnest(neg.eq, keep_empty = TRUE) %>% 
-        select(ID, pos.eq, neg.eq) %>%
-        left_join(., unnest(pos_lookup, ID), 
-                  by = c("neg.eq" = "ID"), 
-                  relationship = "many-to-many") %>%
-        distinct(pos.eq = pos.eq.x, neg.from = pos.eq.y) %>%
-        aggregate(neg.from ~ pos.eq, data = ., c, na.action = na.pass) %>%
-        mutate(neg.from = lapply(neg.from, function(x) x[!is.na(x)]))
-      # NOTE: a block w/ no neg constraints is not NA, but length = 0
-    
-      ##########  Check for contradictions  ####################################
-      
-      conflict <- any(purrr::map2_lgl(
-        .x = as.integer(block_rels$pos.eq),
-        .y = block_rels$neg.from,
-        ~ any(as.integer(.y) == .x)
-      ))
-      
-      if (conflict == TRUE) { ## i.e. only stops if conflict is TRUE
-        
-        stop("There is at least one contradiction among `pos.eq` and `neg.eq` present in the blocks; must resolve inputs before proceeding.")
       }
       
-      ##########  Dealing with z_b for Negative Constraints ####################
-    
-      dist.sq_b[!is.finite(dist.sq_b)] <- Inf   ## precaution for large sums
-    
-      for (b in 1:B) {
+      ############################################################################
+      ##########  Unbiased MLEs for mu & sigma   #################################
+      ############################################################################
       
-        neg_blocks <- as.integer(block_rels$neg.from[[b]])  ## neg blocks for each
-        neg_blocks <- neg_blocks[!is.na(neg_blocks)]        ## pos block
-      
-        sum_k <- numeric(k)   ## initialize each sum of the kth cluster
-      
-        for (l in 1:k) {
+      if (!pos_only_mode) {
         
-          if (!is.finite(dist.sq_b[b, l])) {  ## precaution for large sums
-          
-            sum_k[l] <- -Inf  ## will not matter since we take max k
-            next
-          
-          }
+        mu_kj <- matrix(NA, nrow = k, ncol = p)   ## matrix of mean estimates
         
-          if (length(neg_blocks) == 0) {  ## for 'NA' negative constraints
-          
-            sum_k[l] <- exp(- dist.sq_b[b, l] / (2 * sigma.sq))   ## i.e. just sum
-            next                                                  ## over kth cluster
-          
-          }
+        ##########  Calculating each mu_kj #####################################
         
-          ##########  Complex Negative Constraint Cases ########################
-        
-          if (length(neg_blocks) > length(setdiff(1:k, l))) {   ## focus on kth cluster
+        for (j in 1:p) {
           
-            sum_k[l] <- 0   ## initializing sums for blocks w/ neg constraints
-            next
-          
-          }
-          
-          if (length(neg_blocks) == 1) {
-          
-            perms_list <- lapply(setdiff(1:k, l), identity) ## returns (1:k)\l list
-          
-          } else {  ## NOTE this is necessary b/c must consider all cluster assignments
-            ## per each 'focus' cluster and each negative constraint
-          
-            combs <- combn(setdiff(1:k, l),    ## finds all combos of clusters
-                          length(neg_blocks), ## minus the kth 'focus' cluster
-                          simplify = FALSE)   ## `FALSE` indicates a list returns
-          
-            perms_list <- purrr::map(combs, ~ {   ## permutates all combos
-              pm <- arrangements::permutations(.x)
-              split(pm, seq_len(nrow(pm)))  ## writes elements as rows 
-            }
-            ) %>% 
-              purrr::list_flatten()   ## coerces to one long list
-          }
-        
-          ##########  Taking the sums ##########################################
-        
-          s <- 0  ## sum[exp(-1/(2*sigma^2)*(sum dist.sq_b))]
-        
-          for (pl in perms_list) {
-          
-            pl_vec <- as.integer(pl)  ## coercing to numeric for compatibility
-          
-            tot <- dist.sq_b[b, l]  ## initializing sum dist.sq_b
-          
-            for (nb in seq_along(neg_blocks)) {   ## i.e. nb is specific neq block
+          for (l in 1:k) {
             
-              add <- dist.sq_b[neg_blocks[nb], pl_vec[nb]]
+            mu_kj[l, j] <- mean(data_num[cluster == l, j])
             
-              if (!is.finite(add)) {  ## precaution for large sums
+          }
+        }
+        
+        SSE <- 0  ## initializing SSE (within-cluster)
+        
+        X <- as.matrix(unname(data_num))  ## copy of data_num
+        
+        ##########  Calculating sigma squared ##################################
+        
+        for (j in 1:p) {  ## over x-vars
+          
+          for (l in 1:k) {  ## over centers
+            
+            for (i in which(cluster == l)) {  ## over clusters
               
-                tot <- Inf
-                break 
+              SSE <- SSE + (X[i, j] - mu_kj[l, j])^2  ## WCSS
               
-              }
-            
-              tot <- tot + add  ## adds each neg Euc Dist (inner sums)
             }
-          
-            s <- s + exp(- tot / (2 * sigma.sq))  ## outer sums
           }
-        
-          sum_k[l] <- s
         }
+        
+        sigma.sq <- SSE / (p * (n - k))  # unbiased
+        
+        ##########################################################################
+        ##########  Negative K-M  ################################################
+        ##########################################################################
+        
+        block_rels <- data.frame(    ## used for returned results & summation indices
+          pos.eq   = 1:B_neg,
+          neg.from = I(
+            lapply(1:B_neg, function(b) {which(neg.eq[b, ] == 1)} )
+          )
+        )
+        
+        ##########  Euclidean Distances for Blocks  ##############################
+        
+        dist.sq_b <- matrix(nrow = B_neg, ncol = k)   ## initializing dist.sq_b for blocks
+        
+        for(b in 1:B_neg) {
+          
+          data.b <- as.matrix(data_num[unlist(pos.eq[b]), , drop = FALSE]) ## block `b` data
+          
+          dist.b_sum <- 0 ## initializing dist.b_sum
+          
+          for(i in 1:nrow(data.b)) {
+            
+            dist.b <- data.b[i,] %>%  ## similar to Euc Dist for single obs
+              rbind(mu_kj) %>%
+              dist()
+            
+            dist.b_sum <- dist.b_sum + dist.b[1:k]^2
+            
+          }
+          
+          dist.sq_b[b,] <- dist.b_sum   ## grouped by obs in block `b`
+          
+        }
+        
+        # Using each `dist.sq_b` to compute weights `w[b, l]` (to be added for z_b)
+        
+        w <- exp( -dist.sq_b / (2 * sigma.sq) ) ## w[b, l] = exp(-(dist.sq_b[b, ]) / (2 sigma^2))
+        w[!is.finite(w)] <- 0    ## NaN as 0
+        
+        ##########  Block cluster assignments with negative constraints ########
+        
+        for (b in 1:B_neg) {
+          
+          neg_blocks <- as.integer(block_rels$neg.from[[b]])
+          neg_blocks <- neg_blocks[!is.na(neg_blocks)]
+          
+          m <- length(neg_blocks)
+          
+          # Initializing objective for `z_b`:
+          sum_k <- numeric(k)    ## max(sum_k) implies z_b assignment
+          
+          for (l in 1:k) {
+            
+            if (m == 0) {    ## no neg constraints for block `b`
+              sum_k[l] <- w[b, l]
+              next
+            }
+            
+            ## clusters currently used by negatively related blocks
+            neg_block_clusters <- unique(cluster[unlist(pos.eq[neg_blocks])])
+            
+            if (any(neg_block_clusters == l)) { ## if cluster `l` is taken by a neg block
+              sum_k[l] <- 0
+              next
+            }
+            
+            if (w[b, l] == 0 || !is.finite(w[b, l])) { ## if weight is zero or NaN
+              sum_k[l] <- 0
+              next
+            }
+            
+            # Calculating objective for `z_b`:
+            minus_k <- setdiff(1:k, l)    ## all clusters besides focus `l`
+            
+            # Allow reuse of clusters if m > length(minus_k)
+            use_replace <- m > length(minus_k)
+            
+            perms_mat <- arrangements::permutations(
+              x = minus_k,
+              k = m,
+              replace = use_replace
+            )
+            
+            # Defensive: if for some reason we got no permutations, treat as 0 contribution
+            if (nrow(perms_mat) == 0) {
+              sum_k[l] <- 0
+              next
+            }
+            
+            s <- 0  ## initializing summation for `z_b`
+            
+            for (i in 1:nrow(perms_mat)) {
+              
+              cols <- perms_mat[i, ]              ## cluster labels directly
+              vals <- w[cbind(neg_blocks, cols)]   ## vector of weights for neg blocks
+              
+              s <- s + w[b, l] * prod(vals)        ## contribution to summation
+            }
+            
+            sum_k[l] <- s
+          }
+          
+          zb[b] <- which.max(sum_k)
+          
+          cluster[unlist(pos.eq[b])] <- zb[b]
+        }
+        
+      }   ## end of `if (!pos_only_mode)`
       
-        zb[b] <- which.max(sum_k)
+      ############################################################################
+      ##########  After each Iteration ###########################################
+      ############################################################################
       
-        cluster[data$pos.eq == b] <- zb[b]  ## final cluster assignments
+      if (all(cluster == prev_cluster)) {   ## ends on cluster convergence
+        
+        stopper <- 1
+        
       }
-    }   ## end of `if (!pos_only_mode)`
-    
-    ############################################################################
-    ##########  After each Iteration ###########################################
-    ############################################################################
-    
-    if (all(cluster == prev_cluster)) {   ## ends on cluster convergence
       
-      stopper <- 1
+      prev_cluster <- cluster   ## assigning last iteration to `prev_cluster`
       
-    }
+      ##########  Recompute centers ##############################################
+      
+      centers <- data_num %>%
+        mutate(cluster = cluster) %>%   ## necessary since `cluster` has changed
+        group_by(cluster) %>%
+        summarise(across(where(is.numeric), mean), .groups = "drop") %>%
+        select(-cluster) %>%
+        as.data.frame()
+      
+      ##########  Begin next Iteration  ##########################################
+      
+      iter <- iter + 1
+      
+      if (iter > max.iter) {  ## maximum iteration occurred before convergence
+        
+        message("Reached maximum iterations before convergence.")
+        stopper <- 1
+        
+      }
+      
+      ############################################################################
+    } ########## End `while` #####################################################
+    ############################################################################
     
-    prev_cluster <- cluster   ## assigning last iteration to `prev_cluster`
+    ##########  Outputs ##########################################################
     
-    ##########  Recompute centers ##############################################
+    sizes <- tabulate(cluster, nbins = k)    ## each n_b
     
-    centers <- data_num %>%
-      mutate(cluster = cluster) %>%   ## necessary since `cluster` has changed
+    centers_out <- data_num %>%   ## final centers / centroids
+      mutate(cluster = cluster) %>%
       group_by(cluster) %>%
       summarise(across(where(is.numeric), mean), .groups = "drop") %>%
-      select(-cluster) %>%
       as.data.frame()
     
-    ##########  Begin next Iteration  ##########################################
+    ##########  Record best WCSS & result  #####################################
     
-    iter <- iter + 1
+    WCSS <- numeric(k)  ## initializing WCSS
     
-    if (iter > max.iter) {  ## maximum iteration occurred before convergence
+    X <- as.matrix(unname(data_num))  ## copy of data_num
+    
+    for (j in 1:p) {  ## over x-vars
       
-      message("Reached maximum iterations before convergence.")
-      stopper <- 1
-      
-    }
-    
-    ############################################################################
-  } ########## End `while` #####################################################
-    ############################################################################
-  
-  ##########  Outputs ##########################################################
-  
-  sizes <- data %>%   ## each n_b
-    mutate(cluster = cluster) %>%   ## necessary since `cluster` has changed
-    count(cluster) %>%
-    pull(n)
-  
-  centers_out <- data_num %>%   ## final centers / centroids
-    mutate(cluster = cluster) %>%
-    group_by(cluster) %>%
-    summarise(across(where(is.numeric), mean), .groups = "drop") %>%
-    as.data.frame()
-  
-  ##########  Record best WCSS & result  #####################################
-  
-  WCSS <- numeric(k)  ## initializing WCSS
-  
-  X <- as.matrix(unname(data_num))  ## copy of data_num
-  
-  for (j in 1:p) {  ## over x-vars
-    
-    for (l in 1:k) {  ## over centers
-      
-      for (i in which(cluster == l)) {  ## over clusters
+      for (l in 1:k) {  ## over centers
         
-        WCSS[l] <- WCSS[l] + (X[i, j] - centers_out[l, j + 1])^2  ## WCSS
-        
+        for (i in which(cluster == l)) {  ## over clusters
+          
+          WCSS[l] <- WCSS[l] + (X[i, j] - centers_out[l, j + 1])^2  ## WCSS
+          
+        }
       }
     }
-  }
-  
-  tot.withinss <- sum(WCSS)
-  
-  result <- list(
-    "cluster" = cluster,
-    "centers" = centers_out,
-    "totss" = totss,
-    "withinss" = WCSS, ####### this should be per cluster (i.e. k numbers)
-    "tot.withinss" = tot.withinss, ###### sum(withinss)
-    "betweenss"  = totss - tot.withinss, ##### totss-tot.withinss
-    "size" = sizes,
-    "iterations" = iter,
-    "blocks" = pos_lookup
+    
+    tot.withinss <- sum(WCSS)
+    
+    result <- list(
+      "cluster" = cluster,
+      "centers" = centers_out,
+      "totss" = totss,
+      "withinss" = WCSS,
+      "tot.withinss" = tot.withinss,
+      "betweenss"  = totss - tot.withinss,
+      "size" = sizes,
+      "iterations" = iter,
+      "blocks" = pos_lookup
     )
-  
-  if (!pos_only_mode) {
-    result$relationships = block_rels
-  }
-  
-  if (tot.withinss < min_totwss) { ## keeps best result across `nstart`
-    min_totwss <- tot.withinss
-    best_result <- result
-  }
-  
+    
+    if (!pos_only_mode) {
+      result$relationships = block_rels
+    }
+    
+    if (tot.withinss < min_totwss) { ## keeps best result across `nstart`
+      min_totwss <- tot.withinss
+      best_result <- result
+    }
+    
   } ## end `for (nstart_placeholder in 1:nstart)`
   
   return(best_result)
 }
-
 
 
 ################################################################################
@@ -442,31 +379,35 @@ df <- data.frame(
   x1 = c(2, 9, 8, 4.5, 3, 6, 8, 11),
   x2 = c(5, 7, 11, 4, 3, 9, 8, 8)
 )
-df$pos <- c(1, NA, 2, NA, 1, 2, 2, NA)
-df$neg <- list(6, 4, NULL, c(2, 6), NULL, c(1, 4), NULL, NULL)
+
 df %>%
   ggplot(aes(x1, x2)) +
-  geom_point() +
+  geom_point(size = 3) +
+  geom_text(aes(label = 1:nrow(df)), vjust = -1) +
   theme_classic()
 
-## with both pos and neg constraints
-sskmeans(data = df, k = 3, pos.eq = 'pos', neg.eq = 'neg', nstart = 50)
+## positive constraints as a list:
+## indices are blocks, elements are observations in that block
+pos.eq <- list(c(1, 5), c(3, 6, 7), 2, 4)
 
-## with ONLY pos constraints
-sskmeans(data = df[,1:3], k = 3, pos.eq = 'pos')
+## using adjacency matrix to represent the negative constraints
+## i.e. each negative constraint in an edge coded `1`; no edges are represented by `0`
 
-## with ONLY neg constraints
-sskmeans(data = df[,c(1:2,4)], k = 3, neg.eq = 'neg')
+## could include a separate function in the package that creates this matrix:
+B <- 4 # number of blocks INVOLVED (i.e. if points are in no constraints, do not include)
+neg.eq <- matrix(data = rep(0, B^2), ## matrix of all zeros to start
+                 nrow = B,
+                 ncol = B)
+neg.eq[1, 2] <- 1   ## 1 means a negative constraint exists between blocks
+neg.eq[1, 3] <- 0   ## change to 1 to make cyclic
+neg.eq[2, 3] <- 0   ## change to 1 to make cyclic
+neg.eq[2, 4] <- 1
+neg.eq[3, 4] <- 1
+neg.eq[lower.tri(neg.eq)] <- t(neg.eq)[lower.tri(neg.eq)]
 
-## vs. NO constraints
-sskmeans(data = df[,1:2], k = 3)
-# compare w/
-kmeans(df[,1:2], 3)
+sskmeans(data = df, k = 3, pos.eq = pos.eq, neg.eq = neg.eq, nstart = 20)
 
-## if pos.eq is a column not indexed at 1
-df2 <- df %>%
-  mutate(pos = case_when(pos == 1 ~ 7,
-                         pos!= 1 ~ pos))
+## could use upper.tri() or lower.tri() in fxn to cut the searches in half
 
-sskmeans(data = df2, k = 3, pos.eq = 'pos', neg.eq = 'neg') ## works the same
-## NOTE that the input block labels change in the algorithm (e.g. `7` becomes `1`)
+library(igraph)
+graph_from_adjacency_matrix(neg.eq, mode = "undirected") %>% plot()
