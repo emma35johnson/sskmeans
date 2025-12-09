@@ -7,9 +7,9 @@ The result of my efforts will be an `R` package with a main function of performi
 
 So far, data must be entered into the function with the following format:
 
- - data must be numeric, with the exception of columns `pos.eq` (positive equivalence constraints) and `neg.eq` (negative equivalence constraints)
- - `pos.eq` and `neg.eq` must be specified as names of existing columns of the data, otherwise defaults to _NULL_
- - `pos.eq` is an integer column of block labels, indicating membership of INDIVIDUAL OBSERVATIONS to the same cluster
- - `neg.eq` must be a list column indicating INDIVIDUAL OBSERVATIONS that should be in a separate cluster than the row indicated
+ - data entered must be numeric
+ - `pos.eq` (positive equivalence constraints) is a BLOCK-LEVEL list indicating membership of INDIVIDUAL OBSERVATIONS (row numbers) to the same cluster
+ - `neg.eq` (negative equivalence constraints) is an adjacency matrix at the BLOCK-LEVEL indicating `1` for pairwise negative constraints; `0` otherwise (i.e. no negative constraint)
+ - `pos.eq` and `neg.eq` both default to _NULL_; function will run with either one, both, or neither
 
 I have included a toy example dataframe to illustrate this set-up at the bottom of the function file.
